@@ -1,0 +1,27 @@
+{
+    "name": "wa-modules-loader",
+    "version": "1.0.0",
+    "description": "A library to load/register deobfuscated modules and a CLI to export WA modules",
+    "license": "MIT",
+    "files": [
+        "dist"
+    ],
+    "main": "dist/import/index.js",
+    "types": "dist/import/index.d.ts",
+    "bin": {
+        "wa-export": "dist/export/index.js"
+    },
+    "scripts": {
+        "build": "tsc",
+        "dev": "tsc -w",
+        "prepare": "tsc"
+    },
+    "engines": {
+        "node": ">=18"
+    },
+    "devDependencies": {
+        "@types/node": "^20.11.0",
+        "prettier": "^3.6.2",
+        "typescript": "^5.9.2"
+    }
+}
