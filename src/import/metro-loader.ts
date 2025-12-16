@@ -138,7 +138,23 @@ export function makeFactoryFromFunctionExpression(fnExprSource: string): Factory
 
 // Very simple extractor: tries to find the first top-level "(function(" and take until the matching closing brace followed by ")".
 export function extractFunctionExpression(raw: string): string {
-    const startIdx = raw.indexOf('(function')
+    let startIdx = raw.indexOf('(function')
+    if (startIdx === -1) {
+        // Some module formats may be '__d(function(...) { ... })' (no leading '(' before function)
+        const dIdx = raw.indexOf('__d(')
+        if (dIdx !== -1) {
+            const fnIdx = raw.indexOf('function', dIdx)
+            if (fnIdx !== -1) {
+                const between = raw.slice(dIdx + '__d('.length, fnIdx)
+                if (/^\s*$/.test(between)) {
+                    startIdx = fnIdx
+                }
+            }
+        }
+        if (startIdx === -1) {
+            startIdx = raw.indexOf('function')
+        }
+    }
     if (startIdx === -1) throw new Error('No function expression wrapper found')
     const openParenIdx = raw.indexOf('{', startIdx)
     if (openParenIdx === -1) throw new Error('No function body start found')
