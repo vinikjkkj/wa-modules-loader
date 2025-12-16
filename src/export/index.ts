@@ -42,7 +42,7 @@ function computeMergePrefixes(
     rawNames: string[],
     minPrefixLen = 3,
     minMembers = 2
-): Array<{ raw: string; norm: string }> {
+): Array<{ raw: string; norm: string; isSuffix?: boolean }> {
     if (rawNames.length < minMembers) return []
 
     const items = rawNames
@@ -63,22 +63,49 @@ function computeMergePrefixes(
         }
     }
 
-    const candidates = [...prefixMembers.entries()]
-        .filter(([_, members]) => members.size >= minMembers)
-        .sort((a, b) => b[0].length - a[0].length || b[1].size - a[1].size)
+    const suffixMembers = new Map<string, Set<string>>()
+    for (const { raw, norm } of items) {
+        const dotIdx = norm.lastIndexOf('.')
+        if (dotIdx > 0) {
+            const suffix = norm.slice(dotIdx + 1)
+            if (suffix.length >= 2) {
+                if (!suffixMembers.has(suffix)) suffixMembers.set(suffix, new Set())
+                suffixMembers.get(suffix)!.add(raw)
+            }
+        }
+    }
 
-    const selected: string[] = []
+    const selected: Array<{ norm: string; isSuffix: boolean }> = []
     const covered = new Set<string>()
 
-    for (const [prefix, members] of candidates) {
+    const suffixCandidates = [...suffixMembers.entries()]
+        .filter(([_, members]) => members.size >= minMembers)
+        .sort((a, b) => b[1].size - a[1].size)
+
+    for (const [suffix, members] of suffixCandidates) {
         const uncovered = [...members].filter((m) => !covered.has(m))
         if (uncovered.length >= minMembers) {
-            selected.push(prefix)
+            selected.push({ norm: suffix, isSuffix: true })
             for (const m of members) covered.add(m)
         }
     }
 
-    return selected.map((norm) => {
+    const prefixCandidates = [...prefixMembers.entries()]
+        .filter(([_, members]) => members.size >= minMembers)
+        .sort((a, b) => b[0].length - a[0].length || b[1].size - a[1].size)
+
+    for (const [prefix, members] of prefixCandidates) {
+        const uncovered = [...members].filter((m) => !covered.has(m))
+        if (uncovered.length >= minMembers) {
+            selected.push({ norm: prefix, isSuffix: false })
+            for (const m of members) covered.add(m)
+        }
+    }
+
+    return selected.map(({ norm, isSuffix }) => {
+        if (isSuffix) {
+            return { raw: norm, norm, isSuffix: true }
+        }
         const matching = items.filter((i) => i.norm.startsWith(norm))
         const withWAWeb = matching.filter((i) => i.raw.startsWith('WAWeb')).length
         const raw = withWAWeb > matching.length / 2 ? `WAWeb${norm}` : norm
@@ -88,29 +115,29 @@ function computeMergePrefixes(
 
 function pickMergeDir(
     rawName: string,
-    prefixes: Array<{ raw: string; norm: string }>
+    prefixes: Array<{ raw: string; norm: string; isSuffix?: boolean }>
 ): string | null {
     const norm = normalizeForMerge(rawName)
 
     const dotIdx = norm.lastIndexOf('.')
     if (dotIdx > 0) {
         const suffix = norm.slice(dotIdx + 1)
-        let best: { raw: string; norm: string } | null = null
         for (const p of prefixes) {
-            if (suffix === p.norm || suffix.startsWith(p.norm)) {
-                if (!best || p.norm.length > best.norm.length) best = p
+            if (p.isSuffix && suffix === p.norm) {
+                return safeNameComponent(p.raw)
             }
         }
-        if (best) return safeNameComponent(best.raw)
     }
 
-    let best: { raw: string; norm: string } | null = null
+    let bestPrefix: { raw: string; norm: string } | null = null
     for (const p of prefixes) {
-        if (norm.startsWith(p.norm)) {
-            if (!best || p.norm.length > best.norm.length) best = p
+        if (!p.isSuffix && norm.startsWith(p.norm)) {
+            if (!bestPrefix || p.norm.length > bestPrefix.norm.length) bestPrefix = p
         }
     }
-    return best ? safeNameComponent(best.raw) : null
+    if (bestPrefix) return safeNameComponent(bestPrefix.raw)
+
+    return null
 }
 
 function hasFlag(args: string[], flagName: string): boolean {
@@ -180,7 +207,7 @@ type WorkerRequest = {
     disambiguate: boolean
     toIa: boolean
     mergeCommonNames: boolean
-    mergeCommonPrefixes: string[] | null
+    mergeCommonPrefixes: Array<{ raw: string; isSuffix?: boolean }> | null
 }
 
 type WorkerChunk = {
@@ -276,7 +303,7 @@ class WorkerPool {
             disambiguate: boolean
             toIa: boolean
             mergeCommonNames: boolean
-            mergeCommonPrefixes: string[] | null
+            mergeCommonPrefixes: Array<{ raw: string; isSuffix?: boolean }> | null
         }
     ) {
         const id = this.nextTaskId++
@@ -719,7 +746,7 @@ export async function buildExportFiles(
         disambiguate?: boolean
         toIa?: boolean
         mergeCommonNames?: boolean
-        mergeCommonPrefixes?: string[] | null
+        mergeCommonPrefixes?: Array<{ raw: string; isSuffix?: boolean }> | null
     }
 ): Promise<ExportFile[]> {
     const calls = extractDCalls(bundleContent)
@@ -736,12 +763,13 @@ export async function buildExportFiles(
     const usedNames = disambiguate ? new Map<string, number>() : null
     const out: ExportFile[] = []
 
-    let mergePrefixes: Array<{ raw: string; norm: string }> = []
+    let mergePrefixes: Array<{ raw: string; norm: string; isSuffix?: boolean }> = []
     if (mergeCommonNames) {
         if (mergeCommonPrefixes && mergeCommonPrefixes.length > 0) {
-            mergePrefixes = mergeCommonPrefixes.map((raw) => ({
-                raw,
-                norm: normalizeForMerge(raw)
+            mergePrefixes = mergeCommonPrefixes.map((p) => ({
+                raw: p.raw,
+                norm: normalizeForMerge(p.raw),
+                isSuffix: p.isSuffix
             }))
         } else {
             const rawNamesForMerge: string[] = []
@@ -850,7 +878,7 @@ if (isMainThread) {
 
     const run = async () => {
         if (!(await fileExists(inputFile))) {
-            console.error(`Input not found: ${inputFile}`)
+            console.error(`Input não encontrado: ${inputFile}`)
             process.exit(1)
         }
 
@@ -959,7 +987,10 @@ if (isMainThread) {
                     }
                 }
 
-                const globalPrefixes = computeMergePrefixes(allRawNames).map((p) => p.raw)
+                const globalPrefixes = computeMergePrefixes(allRawNames).map((p) => ({
+                    raw: p.raw,
+                    isSuffix: p.isSuffix
+                }))
 
                 await runWithConcurrency(
                     fetched.map((x, idx) => ({ idx, item: x })),

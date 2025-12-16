@@ -10,7 +10,7 @@ type WorkerRequest = {
     disambiguate: boolean
     toIa: boolean
     mergeCommonNames: boolean
-    mergeCommonPrefixes: string[] | null
+    mergeCommonPrefixes: Array<{ raw: string; isSuffix?: boolean }> | null
 }
 
 type WorkerChunk = {
@@ -66,8 +66,6 @@ async function handle(req: WorkerRequest) {
     }
 
     for (const f of files) {
-        // Use TextEncoder to ensure a dedicated ArrayBuffer per message.
-        // Buffer allocations may share a pool which is unsafe to transfer.
         const u8 = encoder.encode(f.content)
         const ab = u8.buffer as ArrayBuffer
 
