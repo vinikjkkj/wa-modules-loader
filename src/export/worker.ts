@@ -11,6 +11,7 @@ type WorkerRequest = {
     toIa: boolean
     mergeCommonNames: boolean
     mergeCommonPrefixes: Array<{ raw: string; isSuffix?: boolean }> | null
+    moduleNameFilters: string[]
 }
 
 type WorkerChunk = {
@@ -27,6 +28,7 @@ type WorkerChunk = {
 type WorkerDone = {
     id: number
     kind: 'done'
+    fileCount: number
 }
 
 type WorkerError = {
@@ -45,7 +47,8 @@ async function handle(req: WorkerRequest) {
         disambiguate: req.disambiguate,
         toIa: req.toIa,
         mergeCommonNames: req.mergeCommonNames,
-        mergeCommonPrefixes: req.mergeCommonPrefixes
+        mergeCommonPrefixes: req.mergeCommonPrefixes,
+        moduleNameFilters: req.moduleNameFilters
     })
 
     const encoder = new TextEncoder()
@@ -84,7 +87,7 @@ async function handle(req: WorkerRequest) {
 
     flush()
 
-    const done: WorkerDone = { id: req.id, kind: 'done' }
+    const done: WorkerDone = { id: req.id, kind: 'done', fileCount: files.length }
     parentPort?.postMessage(done)
 }
 

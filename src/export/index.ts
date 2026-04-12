@@ -18,6 +18,117 @@ function getArgValue(args: string[], flagName: string): string | null {
     return found ? found.slice(prefix.length) : null
 }
 
+function getArgValues(args: string[], flagName: string): string[] {
+    const values: string[] = []
+    const prefix = `${flagName}=`
+
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i]
+
+        if (arg === flagName) {
+            const val = i + 1 < args.length ? args[i + 1] : null
+            if (!val || val.startsWith('-')) {
+                throw new Error(`Missing value for ${flagName}`)
+            }
+            values.push(val)
+            i++
+            continue
+        }
+
+        if (arg.startsWith(prefix)) {
+            const val = arg.slice(prefix.length)
+            if (!val) {
+                throw new Error(`Missing value for ${flagName}`)
+            }
+            values.push(val)
+        }
+    }
+
+    return values
+}
+
+function getPositionals(args: string[]): string[] {
+    const flagsWithValue = new Set(['--concurrency', '--workers', '--module-filter'])
+    const positionals: string[] = []
+
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i]
+        if (arg.startsWith('-')) {
+            const base = arg.startsWith('--') ? arg.split('=')[0] : arg
+            if (flagsWithValue.has(base) && arg === base) {
+                const next = i + 1 < args.length ? args[i + 1] : null
+                if (next && !next.startsWith('-')) i++
+            }
+            continue
+        }
+        positionals.push(arg)
+    }
+
+    return positionals
+}
+
+function parseModuleNameFilterPatterns(args: string[]): string[] {
+    return normalizeModuleNameFilterPatterns(getArgValues(args, '--module-filter'))
+}
+
+function normalizeModuleNameFilterPatterns(filters: string[] | undefined): string[] {
+    const cleaned = (filters || []).map((v) => v.trim()).filter(Boolean)
+
+    return [...new Set(cleaned)]
+}
+
+function compileFilterRegex(pattern: string): RegExp {
+    if (!pattern.startsWith('/')) {
+        return new RegExp(pattern, 'i')
+    }
+
+    let lastSlash = -1
+    for (let i = pattern.length - 1; i > 0; i--) {
+        if (pattern[i] !== '/') continue
+        let backslashes = 0
+        for (let j = i - 1; j >= 0 && pattern[j] === '\\'; j--) backslashes++
+        if (backslashes % 2 === 0) {
+            lastSlash = i
+            break
+        }
+    }
+
+    if (lastSlash <= 0) {
+        return new RegExp(pattern, 'i')
+    }
+
+    const body = pattern.slice(1, lastSlash)
+    const flags = pattern.slice(lastSlash + 1)
+    return new RegExp(body, flags)
+}
+
+function compileModuleNameFilters(rawFilters: string[]): RegExp[] {
+    return rawFilters.map((raw) => {
+        try {
+            return compileFilterRegex(raw)
+        } catch (e: any) {
+            const msg = e && typeof e.message === 'string' ? e.message : String(e)
+            throw new Error(`Invalid --module-filter regex '${raw}': ${msg}`)
+        }
+    })
+}
+
+function moduleNameMatchesFilters(rawName: string, filters: RegExp[]): boolean {
+    if (filters.length === 0) return true
+    if (!rawName) return false
+    return filters.some((filter) => {
+        filter.lastIndex = 0
+        return filter.test(rawName)
+    })
+}
+
+function noModulesMessage(filters: RegExp[]): string {
+    if (filters.length === 0) {
+        return 'No module found (marker __d( not found).'
+    }
+    return 'No module found (marker __d( not found or no module matched --module-filter).'
+}
+
 function normalizeForMerge(name: string): string {
     return name.startsWith('WAWeb') ? name.slice('WAWeb'.length) : name
 }
@@ -152,6 +263,7 @@ function assertNoUnknownFlags(args: string[]) {
         '--concurrency',
         '--workers',
         '--merge-common-names',
+        '--module-filter',
         '--help',
         '-h'
     ])
@@ -199,6 +311,27 @@ type ExportFile = {
     content: string
 }
 
+export type ExportModulesOptions = {
+    inputFile: string
+    outputDir?: string
+    toIa?: boolean
+    mergeCommonNames?: boolean
+    workers?: number
+    concurrency?: number
+    flat?: boolean
+    noSubdirs?: boolean
+    moduleNameFilters?: string[]
+}
+
+export type ExportModulesResult = {
+    inputFile: string
+    outputDir: string
+    mode: 'js' | 'json'
+    bundlesProcessed: number
+    filesWritten: number
+    skippedBundles: number
+}
+
 type WorkerRequest = {
     id: number
     bundle: ArrayBuffer
@@ -208,6 +341,7 @@ type WorkerRequest = {
     toIa: boolean
     mergeCommonNames: boolean
     mergeCommonPrefixes: Array<{ raw: string; isSuffix?: boolean }> | null
+    moduleNameFilters: string[]
 }
 
 type WorkerChunk = {
@@ -224,6 +358,7 @@ type WorkerChunk = {
 type WorkerDone = {
     id: number
     kind: 'done'
+    fileCount: number
 }
 
 type WorkerError = {
@@ -241,7 +376,8 @@ class WorkerPool {
         {
             outDir: string
             writeChain: Promise<void>
-            resolve: () => void
+            fileCount: number
+            resolve: (filesWritten: number) => void
             reject: (e: Error) => void
         }
     >()
@@ -274,6 +410,7 @@ class WorkerPool {
         }
 
         if (msg.kind === 'chunk') {
+            t.fileCount += msg.files.length
             t.writeChain = t.writeChain.then(async () => {
                 await runWithConcurrency(msg.files, 20, async (f) => {
                     const buf = Buffer.from(f.data, f.byteOffset, f.byteLength)
@@ -288,7 +425,8 @@ class WorkerPool {
         t.writeChain
             .then(() => {
                 this.tasks.delete(msg.id)
-                t.resolve()
+                t.fileCount = msg.fileCount
+                t.resolve(t.fileCount)
             })
             .catch((e) => {
                 this.tasks.delete(msg.id)
@@ -304,14 +442,16 @@ class WorkerPool {
             toIa: boolean
             mergeCommonNames: boolean
             mergeCommonPrefixes: Array<{ raw: string; isSuffix?: boolean }> | null
+            moduleNameFilters: string[]
         }
-    ) {
+    ): Promise<number> {
         const id = this.nextTaskId++
 
-        const p = new Promise<void>((resolve, reject) => {
+        const p = new Promise<number>((resolve, reject) => {
             this.tasks.set(id, {
                 outDir,
                 writeChain: Promise.resolve(),
+                fileCount: 0,
                 resolve,
                 reject
             })
@@ -325,13 +465,14 @@ class WorkerPool {
             disambiguate: opts.disambiguate,
             toIa: opts.toIa,
             mergeCommonNames: opts.mergeCommonNames,
-            mergeCommonPrefixes: opts.mergeCommonPrefixes
+            mergeCommonPrefixes: opts.mergeCommonPrefixes,
+            moduleNameFilters: opts.moduleNameFilters
         }
 
         const w = this.workers[this.nextWorkerIdx]
         this.nextWorkerIdx = (this.nextWorkerIdx + 1) % this.workers.length
         w.postMessage(req, [bundle.buffer])
-        await p
+        return await p
     }
 
     async destroy() {
@@ -693,6 +834,9 @@ function printUsageAndExit() {
     console.error(
         '   --workers N           : number of worker threads for bundle processing (default: 0; supports --workers=N)'
     )
+    console.error(
+        '   --module-filter REGEXP: export only modules whose names match REGEXP (repeatable)'
+    )
     console.error('   --help | -h           : show this help')
     console.error("   If not given, will be '<inputDir>/deobfuscated/<inputNameWithoutExt>'")
     process.exit(1)
@@ -747,6 +891,7 @@ export async function buildExportFiles(
         toIa?: boolean
         mergeCommonNames?: boolean
         mergeCommonPrefixes?: Array<{ raw: string; isSuffix?: boolean }> | null
+        moduleNameFilters?: string[]
     }
 ): Promise<ExportFile[]> {
     const calls = extractDCalls(bundleContent)
@@ -759,6 +904,24 @@ export async function buildExportFiles(
     const toIa = opts?.toIa === true
     const mergeCommonNames = opts?.mergeCommonNames === true
     const mergeCommonPrefixes = opts?.mergeCommonPrefixes ?? null
+    const moduleNameFilters = compileModuleNameFilters(opts?.moduleNameFilters ?? [])
+    const filteredCalls =
+        moduleNameFilters.length === 0
+            ? calls.map((dCall) => ({
+                  dCall,
+                  rawName: (extractFirstStringArg(dCall) || '').trim()
+              }))
+            : calls
+                  .map((dCall) => ({
+                      dCall,
+                      rawName: (extractFirstStringArg(dCall) || '').trim()
+                  }))
+                  .filter((entry) => moduleNameMatchesFilters(entry.rawName, moduleNameFilters))
+
+    if (filteredCalls.length === 0) {
+        return []
+    }
+
     let count = 0
     const usedNames = disambiguate ? new Map<string, number>() : null
     const out: ExportFile[] = []
@@ -773,8 +936,7 @@ export async function buildExportFiles(
             }))
         } else {
             const rawNamesForMerge: string[] = []
-            for (const dCall of calls) {
-                const rawName = (extractFirstStringArg(dCall) || '').trim()
+            for (const { rawName } of filteredCalls) {
                 if (rawName && /^[\w\[\]-]+/.test(rawName)) {
                     rawNamesForMerge.push(rawName)
                 }
@@ -783,8 +945,7 @@ export async function buildExportFiles(
         }
     }
 
-    for (const dCall of calls) {
-        const rawName = (extractFirstStringArg(dCall) || '').trim()
+    for (const { dCall, rawName } of filteredCalls) {
         const safeBaseBase =
             rawName && /^[\w\[\]-]+/.test(rawName)
                 ? rawName.replace(/[^\w\-\[\]]+/g, '_')
@@ -839,62 +1000,58 @@ function safeDirNameFromUrl(url: string, fallbackIndex: number): string {
     }
 }
 
-if (isMainThread) {
-    const args = process.argv.slice(2)
-    const positionals = args.filter((a) => !a.startsWith('-'))
-
-    assertNoUnknownFlags(args)
-
-    if (hasFlag(args, '--help') || hasFlag(args, '-h')) {
-        printUsageAndExit()
-    }
-
-    const inputArg = positionals[0]
-    const outputArg = positionals[1]
-
-    if (!inputArg) {
-        printUsageAndExit()
-    }
-
-    const inputFile = path.resolve(process.cwd(), inputArg)
-    const defaultOut = path.join(
+function defaultOutputDirForInput(inputFile: string): string {
+    return path.join(
         path.dirname(inputFile),
         'deobfuscated',
         path.basename(inputFile, path.extname(inputFile))
     )
-    const outputDir = outputArg ? path.resolve(process.cwd(), outputArg) : defaultOut
+}
 
-    const suggested = Math.max(1, os.cpus().length - 1)
-    const workersRaw = getArgValue(args, '--workers')
-    const workersFlagPresent = hasFlag(args, '--workers')
-    const workers = workersRaw === null ? (workersFlagPresent ? suggested : 0) : Number(workersRaw)
-    if (!Number.isFinite(workers) || workers < 0) {
-        throw new Error(`Invalid --workers value: ${String(workersRaw)}`)
+export async function exportModules(options: ExportModulesOptions): Promise<ExportModulesResult> {
+    const inputFile = path.resolve(process.cwd(), options.inputFile)
+    const outputDir = options.outputDir
+        ? path.resolve(process.cwd(), options.outputDir)
+        : defaultOutputDirForInput(inputFile)
+
+    if (!(await fileExists(inputFile))) {
+        throw new Error(`Input não encontrado: ${inputFile}`)
     }
 
-    const poolSize = Math.floor(workers)
+    const ext = path.extname(inputFile).toLowerCase()
+    if (ext !== '.js' && ext !== '.json') {
+        throw new Error(`Unsupported input extension: ${ext}. Use .js or .json`)
+    }
+
+    const workersRaw = options.workers ?? 0
+    if (!Number.isFinite(workersRaw) || workersRaw < 0) {
+        throw new Error(`Invalid workers value: ${String(workersRaw)}`)
+    }
+    const poolSize = Math.floor(workersRaw)
+
+    const moduleNameFilterPatterns = normalizeModuleNameFilterPatterns(options.moduleNameFilters)
+    const moduleNameFilters = compileModuleNameFilters(moduleNameFilterPatterns)
+
+    let filesWritten = 0
+    let skippedBundles = 0
+    let bundlesProcessed = 0
+    const mode: ExportModulesResult['mode'] = ext === '.json' ? 'json' : 'js'
 
     const pool = poolSize > 0 ? new WorkerPool(poolSize) : null
 
-    const run = async () => {
-        if (!(await fileExists(inputFile))) {
-            console.error(`Input não encontrado: ${inputFile}`)
-            process.exit(1)
-        }
-
-        const ext = path.extname(inputFile).toLowerCase()
-
+    try {
         if (ext === '.json') {
-            const mergeCommonNames = hasFlag(args, '--merge-common-names')
-            const flat = hasFlag(args, '--no-subdirs') || hasFlag(args, '--flat')
+            const mergeCommonNames = options.mergeCommonNames === true
+            const flat = options.flat === true || options.noSubdirs === true
             const useUrlSubdirs = !mergeCommonNames && !flat
             const disambiguate = !flat
-            const toIa = hasFlag(args, '--to-ia')
-            const concRaw = getArgValue(args, '--concurrency')
+            const toIa = options.toIa === true
             const defaultConcurrency = Math.max(1, poolSize > 0 ? poolSize : 1)
-            const concurrency = concRaw ? Number(concRaw) : defaultConcurrency
+            const concurrencyRaw = options.concurrency
+            const concurrency =
+                concurrencyRaw === undefined ? defaultConcurrency : Number(concurrencyRaw)
             if (!Number.isFinite(concurrency) || concurrency <= 0) {
-                throw new Error(`Invalid --concurrency value: ${String(concRaw)}`)
+                throw new Error(`Invalid concurrency value: ${String(concurrencyRaw)}`)
             }
 
             const raw = await fs.readFile(inputFile, 'utf-8')
@@ -910,6 +1067,7 @@ if (isMainThread) {
             }
 
             await fs.mkdir(outputDir, { recursive: true })
+            bundlesProcessed = urls.length
 
             const usedDirs = new Map<string, number>()
             const jobs = (urls as string[]).map((url, idx) => {
@@ -934,16 +1092,22 @@ if (isMainThread) {
 
                     if (pool) {
                         const ab = await res.arrayBuffer()
-                        await pool.process(
+                        const written = await pool.process(
                             { buffer: ab, byteOffset: 0, byteLength: ab.byteLength },
                             job.outDir,
                             {
                                 disambiguate,
                                 toIa,
                                 mergeCommonNames,
-                                mergeCommonPrefixes: null
+                                mergeCommonPrefixes: null,
+                                moduleNameFilters: moduleNameFilterPatterns
                             }
                         )
+                        if (written === 0) {
+                            skippedBundles++
+                            return
+                        }
+                        filesWritten += written
                         return
                     }
 
@@ -952,13 +1116,15 @@ if (isMainThread) {
                         disambiguate,
                         toIa,
                         mergeCommonNames,
-                        mergeCommonPrefixes: null
+                        mergeCommonPrefixes: null,
+                        moduleNameFilters: moduleNameFilterPatterns
                     })
                     if (files.length === 0) {
-                        console.error('No module found (marker __d( not found).')
+                        skippedBundles++
                         return
                     }
                     await writeExportFiles(job.outDir, files)
+                    filesWritten += files.length
                 })
             } else {
                 const fetched: Array<{ outDir: string; ab: ArrayBuffer } | null> = new Array(
@@ -981,7 +1147,11 @@ if (isMainThread) {
                     const calls = extractDCalls(text)
                     for (const dCall of calls) {
                         const rawName = (extractFirstStringArg(dCall) || '').trim()
-                        if (rawName && /^[\w\[\]-]+/.test(rawName)) {
+                        if (
+                            rawName &&
+                            /^[\w\[\]-]+/.test(rawName) &&
+                            moduleNameMatchesFilters(rawName, moduleNameFilters)
+                        ) {
                             allRawNames.push(rawName)
                         }
                     }
@@ -993,23 +1163,29 @@ if (isMainThread) {
                 }))
 
                 await runWithConcurrency(
-                    fetched.map((x, idx) => ({ idx, item: x })),
+                    fetched.map((item) => ({ item })),
                     concurrency,
                     async ({ item }) => {
                         if (!item) return
                         await fs.mkdir(item.outDir, { recursive: true })
 
                         if (pool) {
-                            await pool.process(
+                            const written = await pool.process(
                                 { buffer: item.ab, byteOffset: 0, byteLength: item.ab.byteLength },
                                 item.outDir,
                                 {
                                     disambiguate,
                                     toIa,
                                     mergeCommonNames,
-                                    mergeCommonPrefixes: globalPrefixes
+                                    mergeCommonPrefixes: globalPrefixes,
+                                    moduleNameFilters: moduleNameFilterPatterns
                                 }
                             )
+                            if (written === 0) {
+                                skippedBundles++
+                                return
+                            }
+                            filesWritten += written
                             return
                         }
 
@@ -1018,28 +1194,33 @@ if (isMainThread) {
                             disambiguate,
                             toIa,
                             mergeCommonNames,
-                            mergeCommonPrefixes: globalPrefixes
+                            mergeCommonPrefixes: globalPrefixes,
+                            moduleNameFilters: moduleNameFilterPatterns
                         })
                         if (files.length === 0) {
-                            console.error('No module found (marker __d( not found).')
+                            skippedBundles++
                             return
                         }
                         await writeExportFiles(item.outDir, files)
+                        filesWritten += files.length
                     }
                 )
             }
 
-            console.log(`Export finished. Files saved in: ${outputDir}`)
-            return
-        }
-
-        if (ext !== '.js') {
-            throw new Error(`Unsupported input extension: ${ext}. Use .js or .json`)
+            return {
+                inputFile,
+                outputDir,
+                mode,
+                bundlesProcessed,
+                filesWritten,
+                skippedBundles
+            }
         }
 
         await fs.mkdir(outputDir, { recursive: true })
-        const toIa = hasFlag(args, '--to-ia')
-        const mergeCommonNames = hasFlag(args, '--merge-common-names')
+        bundlesProcessed = 1
+        const toIa = options.toIa === true
+        const mergeCommonNames = options.mergeCommonNames === true
 
         if (pool) {
             const buf = await fs.readFile(inputFile)
@@ -1048,7 +1229,7 @@ if (isMainThread) {
             const ab = canTransferZeroCopy
                 ? (buf.buffer as ArrayBuffer)
                 : new Uint8Array(buf).slice().buffer
-            await pool.process(
+            const written = await pool.process(
                 {
                     buffer: ab,
                     byteOffset: 0,
@@ -1059,33 +1240,112 @@ if (isMainThread) {
                     disambiguate: true,
                     toIa,
                     mergeCommonNames,
-                    mergeCommonPrefixes: null
+                    mergeCommonPrefixes: null,
+                    moduleNameFilters: moduleNameFilterPatterns
                 }
             )
-            console.log(`Export finished. Files saved in: ${outputDir}`)
-            return
+            if (written === 0) {
+                skippedBundles = 1
+            } else {
+                filesWritten = written
+            }
+
+            return {
+                inputFile,
+                outputDir,
+                mode,
+                bundlesProcessed,
+                filesWritten,
+                skippedBundles
+            }
         }
 
         const fileContent = await fs.readFile(inputFile, 'utf-8')
         const files = await buildExportFiles(fileContent, {
             toIa,
             mergeCommonNames,
-            mergeCommonPrefixes: null
+            mergeCommonPrefixes: null,
+            moduleNameFilters: moduleNameFilterPatterns
         })
         if (files.length === 0) {
-            console.error('No module found (marker __d( not found).')
-            return
+            skippedBundles = 1
+            return {
+                inputFile,
+                outputDir,
+                mode,
+                bundlesProcessed,
+                filesWritten,
+                skippedBundles
+            }
         }
         await writeExportFiles(outputDir, files)
-        console.log(`Export finished. Files saved in: ${outputDir}`)
+        filesWritten = files.length
+        return {
+            inputFile,
+            outputDir,
+            mode,
+            bundlesProcessed,
+            filesWritten,
+            skippedBundles
+        }
+    } finally {
+        if (pool) await pool.destroy()
+    }
+}
+
+if (isMainThread && require.main === module) {
+    const args = process.argv.slice(2)
+    const positionals = getPositionals(args)
+
+    assertNoUnknownFlags(args)
+
+    if (hasFlag(args, '--help') || hasFlag(args, '-h')) {
+        printUsageAndExit()
     }
 
-    run()
-        .catch((e) => {
-            console.error(e)
-            process.exit(1)
+    const inputArg = positionals[0]
+    const outputArg = positionals[1]
+
+    if (!inputArg) {
+        printUsageAndExit()
+    }
+
+    const moduleNameFilterPatterns = parseModuleNameFilterPatterns(args)
+    const emptyResultMessage = noModulesMessage(compileModuleNameFilters(moduleNameFilterPatterns))
+    const suggestedWorkers = Math.max(1, os.cpus().length - 1)
+    const workersRaw = getArgValue(args, '--workers')
+    const workersFlagPresent = hasFlag(args, '--workers')
+    const workers =
+        workersRaw === null ? (workersFlagPresent ? suggestedWorkers : 0) : Number(workersRaw)
+    if (!Number.isFinite(workers) || workers < 0) {
+        throw new Error(`Invalid --workers value: ${String(workersRaw)}`)
+    }
+    const concRaw = getArgValue(args, '--concurrency')
+    const concurrency = concRaw ? Number(concRaw) : undefined
+    if (concRaw !== null && (!Number.isFinite(concurrency) || (concurrency as number) <= 0)) {
+        throw new Error(`Invalid --concurrency value: ${String(concRaw)}`)
+    }
+
+    const run = async () => {
+        const result = await exportModules({
+            inputFile: inputArg,
+            outputDir: outputArg,
+            toIa: hasFlag(args, '--to-ia'),
+            mergeCommonNames: hasFlag(args, '--merge-common-names'),
+            workers,
+            concurrency,
+            flat: hasFlag(args, '--flat'),
+            noSubdirs: hasFlag(args, '--no-subdirs'),
+            moduleNameFilters: moduleNameFilterPatterns
         })
-        .finally(async () => {
-            if (pool) await pool.destroy()
-        })
+        if (result.filesWritten === 0) {
+            console.error(emptyResultMessage)
+        }
+        console.log(`Export finished. Files saved in: ${result.outputDir}`)
+    }
+
+    run().catch((e) => {
+        console.error(e)
+        process.exit(1)
+    })
 }

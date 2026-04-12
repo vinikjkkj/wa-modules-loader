@@ -1,10 +1,41 @@
 {
     "name": "wa-modules-loader",
-    "version": "1.1.0",
+    "version": "1.1.2",
     "description": "A library to load/register deobfuscated modules and a CLI to export WA modules",
+    "keywords": [
+        "whatsapp",
+        "whatsapp-web",
+        "metro",
+        "deobfuscation",
+        "module-loader",
+        "cli"
+    ],
+    "author": "vinikjkkj",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/vinikjkkj/wa-modules-loader.git"
+    },
+    "bugs": {
+        "url": "https://github.com/vinikjkkj/wa-modules-loader/issues"
+    },
+    "homepage": "https://github.com/vinikjkkj/wa-modules-loader#readme",
+    "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/vinikjkkj"
+    },
     "license": "MIT",
+    "sideEffects": false,
+    "exports": {
+        ".": {
+            "types": "./dist/import/index.d.ts",
+            "default": "./dist/import/index.js"
+        },
+        "./package.json": "./package.json"
+    },
     "files": [
-        "dist"
+        "dist",
+        "LICENSE",
+        "README.md"
     ],
     "main": "dist/import/index.js",
     "types": "dist/import/index.d.ts",
@@ -14,7 +45,8 @@
     "scripts": {
         "build": "tsc",
         "dev": "tsc -w",
-        "prepare": "tsc"
+        "prepare": "tsc",
+        "prepublishOnly": "npm run build"
     },
     "engines": {
         "node": ">=18"

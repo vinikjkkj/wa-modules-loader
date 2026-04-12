@@ -16,6 +16,7 @@ A tiny, TypeScript-first toolkit to work with deobfuscated WhatsApp Web modules.
 - [Install](#install)
 - [Build (repo)](#build-repo)
 - [CLI: Export modules](#cli-export-modules)
+- [Programmatic Export API](#programmatic-export-api)
 - [Library: Load and use modules](#library-load-and-use-modules)
 - [Register external modules](#register-external-modules)
 - [License](#license)
@@ -63,12 +64,51 @@ wa-export C:\path\to\wa-bundle.js C:\path\to\out\deobfuscated
 
 # If <outputDir> is omitted, it defaults to:
 # <inputDir>/deobfuscated/<inputNameWithoutExt>
+
+# Export only modules whose names match a regex:
+wa-export C:\path\to\wa-bundle.js C:\path\to\out --module-filter "Signal|Crypto"
+
+# You can repeat --module-filter (OR behavior):
+wa-export C:\path\to\wa-bundle.js C:\path\to\out --module-filter "/WASignal/i" --module-filter "WACrypto"
 ```
+
+`--module-filter` is regex-based and can be repeated.  
+Plain values are compiled as case-insensitive regex (`new RegExp(value, 'i')`), and `/pattern/flags` keeps the provided flags.
 
 Each file produced still contains the original function wrapper used by Metro.
 These files are later consumed by the library loader.
 
 > Tip: If you are developing locally and want to try the CLI globally, run `npm link` in the repo. That will make the `wa-export` command available in your shell.
+
+---
+
+## Programmatic Export API
+
+You can also run the exporter from code (without shelling out to the CLI):
+
+```ts
+import { exportModules } from 'wa-modules-loader'
+
+const result = await exportModules({
+    inputFile: 'C:/path/to/wa-bundle.js',
+    outputDir: 'C:/path/to/out/deobfuscated',
+    mergeCommonNames: true,
+    moduleNameFilters: ['WASignal', '/Crypto/i'],
+    workers: 4
+})
+
+console.log(result)
+// {
+//   inputFile: 'C:/path/to/wa-bundle.js',
+//   outputDir: 'C:/path/to/out/deobfuscated',
+//   mode: 'js',
+//   bundlesProcessed: 1,
+//   filesWritten: 1234,
+//   skippedBundles: 0
+// }
+```
+
+`exportModules()` supports `.js` and `.json` inputs and uses the same behavior/flags as the CLI (`toIa`, `mergeCommonNames`, `workers`, `concurrency`, `flat`/`noSubdirs`, `moduleNameFilters`).
 
 ---
 
