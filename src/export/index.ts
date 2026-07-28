@@ -158,6 +158,30 @@ function longestCommonPrefix(a: string, b: string): string {
     return a.slice(0, i)
 }
 
+/** First index whose value is >= target, in a lexicographically sorted array. */
+function lowerBound(sorted: string[], target: string): number {
+    let lo = 0
+    let hi = sorted.length
+    while (lo < hi) {
+        const mid = (lo + hi) >>> 1
+        if (sorted[mid] < target) lo = mid + 1
+        else hi = mid
+    }
+    return lo
+}
+
+/** End (exclusive) of the run of values starting with prefix, which begins at from. */
+function prefixEnd(sorted: string[], prefix: string, from: number): number {
+    let lo = from
+    let hi = sorted.length
+    while (lo < hi) {
+        const mid = (lo + hi) >>> 1
+        if (sorted[mid].startsWith(prefix)) lo = mid + 1
+        else hi = mid
+    }
+    return lo
+}
+
 function computeMergePrefixes(
     rawNames: string[],
     minPrefixLen = 3,
@@ -165,22 +189,30 @@ function computeMergePrefixes(
 ): Array<{ raw: string; norm: string; isSuffix?: boolean }> {
     if (rawNames.length < minMembers) return []
 
-    const items = rawNames
+    // Members are tracked per raw name, so repeats add nothing but cost. A
+    // release archive repeats the same module across thousands of chunks.
+    const items = [...new Set(rawNames)]
         .map((raw) => ({ raw, norm: normalizeForMerge(raw) }))
         .filter((x) => x.norm.length >= minPrefixLen)
 
-    items.sort((a, b) => a.norm.localeCompare(b.norm))
+    // Code point order, not locale order: the scan below relies on every name
+    // sharing a given prefix forming one contiguous run.
+    items.sort((a, b) => (a.norm < b.norm ? -1 : a.norm > b.norm ? 1 : 0))
 
-    const prefixMembers = new Map<string, Set<string>>()
+    const norms = items.map((x) => x.norm)
 
-    for (let i = 0; i < items.length; i++) {
-        for (let j = i + 1; j < items.length; j++) {
-            const lcp = longestCommonPrefix(items[i].norm, items[j].norm)
-            if (lcp.length < minPrefixLen) break
-            if (!prefixMembers.has(lcp)) prefixMembers.set(lcp, new Set())
-            prefixMembers.get(lcp)!.add(items[i].raw)
-            prefixMembers.get(lcp)!.add(items[j].raw)
-        }
+    // In a sorted array the common prefix of any pair is the shortest common
+    // prefix of the adjacent pairs between them, so every prefix that could
+    // ever group two names already shows up as an adjacent common prefix. That
+    // turns the pair scan into a single walk, and each prefix's members into a
+    // binary-searched range instead of a set built pair by pair.
+    const prefixRanges = new Map<string, { lo: number; hi: number }>()
+
+    for (let k = 0; k + 1 < norms.length; k++) {
+        const lcp = longestCommonPrefix(norms[k], norms[k + 1])
+        if (lcp.length < minPrefixLen || prefixRanges.has(lcp)) continue
+        const lo = lowerBound(norms, lcp)
+        prefixRanges.set(lcp, { lo, hi: prefixEnd(norms, lcp, lo) })
     }
 
     const suffixMembers = new Map<string, Set<string>>()
@@ -195,7 +227,7 @@ function computeMergePrefixes(
         }
     }
 
-    const selected: Array<{ norm: string; isSuffix: boolean }> = []
+    const selected: Array<{ norm: string; isSuffix: boolean; lo: number; hi: number }> = []
     const covered = new Set<string>()
 
     const suffixCandidates = [...suffixMembers.entries()]
@@ -205,30 +237,35 @@ function computeMergePrefixes(
     for (const [suffix, members] of suffixCandidates) {
         const uncovered = [...members].filter((m) => !covered.has(m))
         if (uncovered.length >= minMembers) {
-            selected.push({ norm: suffix, isSuffix: true })
+            selected.push({ norm: suffix, isSuffix: true, lo: 0, hi: 0 })
             for (const m of members) covered.add(m)
         }
     }
 
-    const prefixCandidates = [...prefixMembers.entries()]
-        .filter(([_, members]) => members.size >= minMembers)
-        .sort((a, b) => b[0].length - a[0].length || b[1].size - a[1].size)
+    const prefixCandidates = [...prefixRanges.entries()]
+        .filter(([_, range]) => range.hi - range.lo >= minMembers)
+        .sort((a, b) => b[0].length - a[0].length || b[1].hi - b[1].lo - (a[1].hi - a[1].lo))
 
-    for (const [prefix, members] of prefixCandidates) {
-        const uncovered = [...members].filter((m) => !covered.has(m))
-        if (uncovered.length >= minMembers) {
-            selected.push({ norm: prefix, isSuffix: false })
-            for (const m of members) covered.add(m)
+    for (const [prefix, range] of prefixCandidates) {
+        let uncovered = 0
+        for (let i = range.lo; i < range.hi; i++) {
+            if (!covered.has(items[i].raw)) uncovered++
+        }
+        if (uncovered >= minMembers) {
+            selected.push({ norm: prefix, isSuffix: false, lo: range.lo, hi: range.hi })
+            for (let i = range.lo; i < range.hi; i++) covered.add(items[i].raw)
         }
     }
 
-    return selected.map(({ norm, isSuffix }) => {
+    return selected.map(({ norm, isSuffix, lo, hi }) => {
         if (isSuffix) {
             return { raw: norm, norm, isSuffix: true }
         }
-        const matching = items.filter((i) => i.norm.startsWith(norm))
-        const withWAWeb = matching.filter((i) => i.raw.startsWith('WAWeb')).length
-        const raw = withWAWeb > matching.length / 2 ? `WAWeb${norm}` : norm
+        let withWAWeb = 0
+        for (let i = lo; i < hi; i++) {
+            if (items[i].raw.startsWith('WAWeb')) withWAWeb++
+        }
+        const raw = withWAWeb > (hi - lo) / 2 ? `WAWeb${norm}` : norm
         return { raw, norm }
     })
 }
@@ -274,6 +311,7 @@ function assertNoUnknownFlags(args: string[]) {
         '--merge-common-names',
         '--module-filter',
         '--direct-url',
+        '--no-dedupe-modules',
         '--help',
         '-h'
     ])
@@ -332,8 +370,16 @@ export type ExportModulesOptions = {
     flat?: boolean
     noSubdirs?: boolean
     moduleNameFilters?: string[]
-    onProgress?: (done: number, total: number) => void
+    dedupeModules?: boolean
+    onProgress?: (done: number, total: number, phase: ExportPhase) => void
 }
+
+/**
+ * 'scan' collects module names ahead of time, which both --merge-common-names
+ * (to pick the folder layout) and archive dedupe need. 'group' is the
+ * single-shot step that turns those names into prefixes.
+ */
+export type ExportPhase = 'scan' | 'group' | 'export'
 
 export type ExportModulesResult = {
     inputFile: string
@@ -342,6 +388,8 @@ export type ExportModulesResult = {
     bundlesProcessed: number
     filesWritten: number
     skippedBundles: number
+    /** Archive entries whose modules were all already owned by an earlier entry. */
+    duplicateBundlesSkipped?: number
 }
 
 type WorkerRequest = {
@@ -354,6 +402,7 @@ type WorkerRequest = {
     mergeCommonNames: boolean
     mergeCommonPrefixes: Array<{ raw: string; isSuffix?: boolean }> | null
     moduleNameFilters: string[]
+    ownedModuleNames: string[] | null
 }
 
 type WorkerChunk = {
@@ -455,6 +504,7 @@ class WorkerPool {
             mergeCommonNames: boolean
             mergeCommonPrefixes: Array<{ raw: string; isSuffix?: boolean }> | null
             moduleNameFilters: string[]
+            ownedModuleNames?: string[] | null
         }
     ): Promise<number> {
         const id = this.nextTaskId++
@@ -478,7 +528,8 @@ class WorkerPool {
             toIa: opts.toIa,
             mergeCommonNames: opts.mergeCommonNames,
             mergeCommonPrefixes: opts.mergeCommonPrefixes,
-            moduleNameFilters: opts.moduleNameFilters
+            moduleNameFilters: opts.moduleNameFilters,
+            ownedModuleNames: opts.ownedModuleNames ?? null
         }
 
         const w = this.workers[this.nextWorkerIdx]
@@ -837,6 +888,12 @@ function printUsageAndExit() {
     console.error(
         '                           non-.js archive entries are dropped and output is always flat'
     )
+    console.error(
+        '   --no-dedupe-modules   : export every copy of a module instead of only the first'
+    )
+    console.error(
+        '                           archive entry that carries it (slower, same files on disk)'
+    )
     console.error(' - flags (only for .json input):')
     console.error(
         '   --no-subdirs | --flat : export all bundles into outputDir (no per-bundle subfolders)'
@@ -912,6 +969,13 @@ export async function buildExportFiles(
         mergeCommonNames?: boolean
         mergeCommonPrefixes?: Array<{ raw: string; isSuffix?: boolean }> | null
         moduleNameFilters?: string[]
+        /**
+         * Names this bundle is responsible for. Modules named anything else are
+         * dropped before minification, which is how a release archive avoids
+         * re-exporting the same module once per chunk that happens to embed it.
+         * Unnamed modules are always kept, since they cannot be attributed.
+         */
+        ownedModuleNames?: string[] | null
     }
 ): Promise<ExportFile[]> {
     const calls = extractDCalls(bundleContent)
@@ -938,7 +1002,12 @@ export async function buildExportFiles(
                   }))
                   .filter((entry) => moduleNameMatchesFilters(entry.rawName, moduleNameFilters))
 
-    if (filteredCalls.length === 0) {
+    const owned = opts?.ownedModuleNames ? new Set(opts.ownedModuleNames) : null
+    const ownedCalls = owned
+        ? filteredCalls.filter((entry) => !entry.rawName || owned.has(entry.rawName))
+        : filteredCalls
+
+    if (ownedCalls.length === 0) {
         return []
     }
 
@@ -956,7 +1025,7 @@ export async function buildExportFiles(
             }))
         } else {
             const rawNamesForMerge: string[] = []
-            for (const { rawName } of filteredCalls) {
+            for (const { rawName } of ownedCalls) {
                 if (rawName && /^[\w\[\]-]+/.test(rawName)) {
                     rawNamesForMerge.push(rawName)
                 }
@@ -965,7 +1034,7 @@ export async function buildExportFiles(
         }
     }
 
-    for (const { dCall, rawName } of filteredCalls) {
+    for (const { dCall, rawName } of ownedCalls) {
         const safeBaseBase =
             rawName && /^[\w\[\]-]+/.test(rawName)
                 ? rawName.replace(/[^\w\-\[\]]+/g, '_')
@@ -1124,6 +1193,7 @@ async function exportFromDirectUrl(
     const moduleNameFilters = compileModuleNameFilters(moduleNameFilterPatterns)
     const toIa = options.toIa === true
     const mergeCommonNames = options.mergeCommonNames === true
+    const dedupeModules = options.dedupeModules !== false
 
     const defaultConcurrency = Math.max(4, poolSize)
     const concurrencyRaw = options.concurrency
@@ -1140,6 +1210,7 @@ async function exportFromDirectUrl(
     let filesWritten = 0
     let skippedBundles = 0
     let bundlesProcessed = 0
+    let duplicateBundlesSkipped = 0
 
     await fs.mkdir(outputDir, { recursive: true })
     await downloadToFile(url, tmpFile)
@@ -1195,36 +1266,63 @@ async function exportFromDirectUrl(
             bundlesProcessed = jsEntries.length
 
             let globalPrefixes: Array<{ raw: string; isSuffix?: boolean }> | null = null
+            let ownedByEntry: Array<string[]> | null = null
+            let entryHasUnnamed: boolean[] | null = null
 
-            if (mergeCommonNames) {
-                // Grouping needs the module names of the whole archive up front,
-                // but the archive does not fit in memory, so names are collected
-                // in a first pass and the payloads are re-read afterwards.
-                const allRawNames: string[] = []
+            if (mergeCommonNames || dedupeModules) {
+                // Grouping needs every module name up front to decide the folder
+                // layout, and dedupe needs to know which entry owns each name.
+                // The archive does not fit in memory, so names are collected in a
+                // first pass and the payloads are re-read afterwards.
+                const owner = new Map<string, number>()
+                const unnamed = new Array<boolean>(jsEntries.length).fill(false)
                 let scanned = 0
-                await runWithConcurrency(jsEntries, concurrency, async (entry) => {
+
+                await runWithConcurrency(jsEntries, concurrency, async (entry, index) => {
                     const buf = await reader.read(entry)
                     for (const dCall of extractDCalls(buf.toString('utf-8'))) {
                         const rawName = (extractFirstStringArg(dCall) || '').trim()
-                        if (
-                            rawName &&
-                            /^[\w\[\]-]+/.test(rawName) &&
-                            moduleNameMatchesFilters(rawName, moduleNameFilters)
-                        ) {
-                            allRawNames.push(rawName)
+                        if (!rawName) {
+                            unnamed[index] = true
+                            continue
                         }
+                        if (!moduleNameMatchesFilters(rawName, moduleNameFilters)) continue
+                        // First entry to carry a name keeps it; the copies in
+                        // every other chunk are redundant work.
+                        if (!owner.has(rawName)) owner.set(rawName, index)
                     }
-                    options.onProgress?.(++scanned, jsEntries.length)
+                    options.onProgress?.(++scanned, jsEntries.length, 'scan')
                 })
 
-                globalPrefixes = computeMergePrefixes(allRawNames).map((p) => ({
-                    raw: p.raw,
-                    isSuffix: p.isSuffix
-                }))
+                if (dedupeModules) {
+                    ownedByEntry = jsEntries.map(() => [])
+                    for (const [name, index] of owner) ownedByEntry[index].push(name)
+                    entryHasUnnamed = unnamed
+                }
+
+                if (mergeCommonNames) {
+                    const mergeNames = [...owner.keys()].filter((n) => /^[\w\[\]-]+/.test(n))
+                    options.onProgress?.(0, mergeNames.length, 'group')
+                    globalPrefixes = computeMergePrefixes(mergeNames).map((p) => ({
+                        raw: p.raw,
+                        isSuffix: p.isSuffix
+                    }))
+                    options.onProgress?.(mergeNames.length, mergeNames.length, 'group')
+                }
             }
 
             let processed = 0
-            await runWithConcurrency(jsEntries, concurrency, async (entry) => {
+            await runWithConcurrency(jsEntries, concurrency, async (entry, index) => {
+                const owned = ownedByEntry ? ownedByEntry[index] : null
+
+                // Nothing to export and nothing unattributable to keep: the
+                // entry can be skipped without even inflating it.
+                if (owned && owned.length === 0 && !entryHasUnnamed?.[index]) {
+                    duplicateBundlesSkipped++
+                    options.onProgress?.(++processed, jsEntries.length, 'export')
+                    return
+                }
+
                 const buf = await reader.read(entry)
 
                 if (pool) {
@@ -1233,7 +1331,8 @@ async function exportFromDirectUrl(
                         toIa,
                         mergeCommonNames,
                         mergeCommonPrefixes: globalPrefixes,
-                        moduleNameFilters: moduleNameFilterPatterns
+                        moduleNameFilters: moduleNameFilterPatterns,
+                        ownedModuleNames: owned
                     })
                     if (written === 0) skippedBundles++
                     else filesWritten += written
@@ -1243,7 +1342,8 @@ async function exportFromDirectUrl(
                         toIa,
                         mergeCommonNames,
                         mergeCommonPrefixes: globalPrefixes,
-                        moduleNameFilters: moduleNameFilterPatterns
+                        moduleNameFilters: moduleNameFilterPatterns,
+                        ownedModuleNames: owned
                     })
                     if (files.length === 0) {
                         skippedBundles++
@@ -1253,7 +1353,7 @@ async function exportFromDirectUrl(
                     }
                 }
 
-                options.onProgress?.(++processed, jsEntries.length)
+                options.onProgress?.(++processed, jsEntries.length, 'export')
             })
         } finally {
             await reader.close()
@@ -1265,7 +1365,8 @@ async function exportFromDirectUrl(
             mode: 'archive',
             bundlesProcessed,
             filesWritten,
-            skippedBundles
+            skippedBundles,
+            duplicateBundlesSkipped
         }
     } finally {
         if (pool) await pool.destroy()
@@ -1601,11 +1702,26 @@ if (isMainThread && require.main === module) {
         throw new Error(`Invalid --concurrency value: ${String(concRaw)}`)
     }
 
+    const progressLabels: Record<ExportPhase, string> = {
+        scan: 'Scanning module names',
+        group: 'Grouping module names',
+        export: 'Exporting'
+    }
+    let lastProgressPhase: ExportPhase | null = null
     let lastProgressAt = 0
-    const onProgress = (done: number, total: number) => {
-        if (done !== total && done - lastProgressAt < 500) return
+    const onProgress = (done: number, total: number, phase: ExportPhase) => {
+        // Each phase counts from zero again, so the throttle has to reset with
+        // it -- otherwise every phase after the first stays silent until it ends
+        // and the run looks hung.
+        if (phase !== lastProgressPhase) {
+            lastProgressPhase = phase
+            lastProgressAt = 0
+        } else if (done !== total && done - lastProgressAt < 500) {
+            return
+        }
         lastProgressAt = done
-        console.error(`Processed ${done}/${total} bundles...`)
+        const unit = phase === 'group' ? 'names' : 'bundles'
+        console.error(`${progressLabels[phase]}: ${done}/${total} ${unit}...`)
     }
 
     const run = async () => {
@@ -1620,7 +1736,8 @@ if (isMainThread && require.main === module) {
             concurrency,
             flat: hasFlag(args, '--flat'),
             noSubdirs: hasFlag(args, '--no-subdirs'),
-            moduleNameFilters: moduleNameFilterPatterns
+            moduleNameFilters: moduleNameFilterPatterns,
+            dedupeModules: !hasFlag(args, '--no-dedupe-modules')
         })
         if (result.filesWritten === 0) {
             console.error(emptyResultMessage)

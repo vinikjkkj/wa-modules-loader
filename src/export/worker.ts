@@ -12,6 +12,7 @@ type WorkerRequest = {
     mergeCommonNames: boolean
     mergeCommonPrefixes: Array<{ raw: string; isSuffix?: boolean }> | null
     moduleNameFilters: string[]
+    ownedModuleNames: string[] | null
 }
 
 type WorkerChunk = {
@@ -48,7 +49,8 @@ async function handle(req: WorkerRequest) {
         toIa: req.toIa,
         mergeCommonNames: req.mergeCommonNames,
         mergeCommonPrefixes: req.mergeCommonPrefixes,
-        moduleNameFilters: req.moduleNameFilters
+        moduleNameFilters: req.moduleNameFilters,
+        ownedModuleNames: req.ownedModuleNames
     })
 
     const encoder = new TextEncoder()

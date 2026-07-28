@@ -102,11 +102,28 @@ Notes for archive input:
 - **Non-`.js` entries are dropped** (a release archive also ships `.css` and
   other assets, which can never contain `__d(` modules).
 - Output is **always flat** — archive entries are content-addressed by hash, so a
-  subfolder per bundle would just be noise. Modules with the same name across
-  different chunks collapse onto the same file. Use `--merge-common-names` to
-  group by module name instead.
+  subfolder per bundle would just be noise. Use `--merge-common-names` to group
+  by module name instead.
 - ZIP64 archives are supported (required past 65535 entries), and entries are
   inflated one at a time, so a multi-GB archive never has to fit in memory.
+
+### Duplicate modules in an archive
+
+A release archive embeds the same module in every chunk that depends on it, so
+the same name shows up many times over. By default each module is exported once,
+from the **first** entry that carries it — every later copy would only overwrite
+an identical path. A scan pass runs first to decide the ownership, and entries
+that end up owning nothing are skipped without being inflated at all.
+
+Pass `--no-dedupe-modules` to export every copy instead. The files on disk end up
+the same; it is only slower.
+
+> **Which copy wins matters.** Releases ship several transpilation targets of the
+> same module — one using `async`/`await` directly, another lowered onto
+> `asyncToGeneratorRuntime`. They share a name but not a body. Deduping makes the
+> choice deterministic (first in archive order); without it the winner is
+> whichever worker happened to finish last. If you need a specific flavour,
+> select it with `--module-filter` rather than relying on either order.
 
 Each file produced still contains the original function wrapper used by Metro.
 These files are later consumed by the library loader.
