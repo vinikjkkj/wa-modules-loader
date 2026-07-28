@@ -1,10 +1,14 @@
 #!/usr/bin/env node
-import { createHash } from 'crypto'
-import { promises as fs } from 'fs'
+import { createHash, randomBytes } from 'crypto'
+import { createWriteStream, promises as fs } from 'fs'
 import os from 'os'
 import path from 'path'
+import { Readable } from 'stream'
+import { pipeline } from 'stream/promises'
 import { minify } from 'terser'
 import { Worker, isMainThread } from 'worker_threads'
+
+import { ZipReader, type ZipEntry } from './zip'
 
 function getArgValue(args: string[], flagName: string): string | null {
     const idx = args.indexOf(flagName)
@@ -48,7 +52,12 @@ function getArgValues(args: string[], flagName: string): string[] {
 }
 
 function getPositionals(args: string[]): string[] {
-    const flagsWithValue = new Set(['--concurrency', '--workers', '--module-filter'])
+    const flagsWithValue = new Set([
+        '--concurrency',
+        '--workers',
+        '--module-filter',
+        '--direct-url'
+    ])
     const positionals: string[] = []
 
     for (let i = 0; i < args.length; i++) {
@@ -264,6 +273,7 @@ function assertNoUnknownFlags(args: string[]) {
         '--workers',
         '--merge-common-names',
         '--module-filter',
+        '--direct-url',
         '--help',
         '-h'
     ])
@@ -312,7 +322,8 @@ type ExportFile = {
 }
 
 export type ExportModulesOptions = {
-    inputFile: string
+    inputFile?: string
+    directUrl?: string
     outputDir?: string
     toIa?: boolean
     mergeCommonNames?: boolean
@@ -321,12 +332,13 @@ export type ExportModulesOptions = {
     flat?: boolean
     noSubdirs?: boolean
     moduleNameFilters?: string[]
+    onProgress?: (done: number, total: number) => void
 }
 
 export type ExportModulesResult = {
     inputFile: string
     outputDir: string
-    mode: 'js' | 'json'
+    mode: 'js' | 'json' | 'url' | 'archive'
     bundlesProcessed: number
     filesWritten: number
     skippedBundles: number
@@ -387,7 +399,7 @@ class WorkerPool {
         this.workers = new Array(count).fill(0).map(() => {
             const w = new Worker(workerPath)
             w.on('message', (msg: WorkerChunk | WorkerDone | WorkerError) => this.onMessage(msg))
-            w.on('error', (e) => this.onWorkerError(e))
+            w.on('error', (e: Error) => this.onWorkerError(e))
             return w
         })
     }
@@ -814,9 +826,17 @@ function extractFirstStringArg(dCall: string): string | null {
 
 function printUsageAndExit() {
     console.error('Usage: wa-export <inputFile.js|inputFile.json> <outputDir?>')
+    console.error('       wa-export --direct-url <URL> <outputDir?>')
     console.error(' - inputFile.js: bundle path')
     console.error(' - inputFile.json: JSON file with a string[] of URLs to .js bundles')
     console.error(' - outputDir (opcional): output dir')
+    console.error(' - flags (only for --direct-url):')
+    console.error(
+        '   --direct-url URL      : download and export a .js bundle or a release .zip archive;'
+    )
+    console.error(
+        '                           non-.js archive entries are dropped and output is always flat'
+    )
     console.error(' - flags (only for .json input):')
     console.error(
         '   --no-subdirs | --flat : export all bundles into outputDir (no per-bundle subfolders)'
@@ -1008,7 +1028,263 @@ function defaultOutputDirForInput(inputFile: string): string {
     )
 }
 
+function defaultOutputDirForUrl(url: string): string {
+    let name = ''
+    try {
+        const u = new URL(url)
+        const segments = u.pathname.split('/').filter(Boolean)
+        const tail = segments.slice(-2).join('_')
+        name = safeNameComponent(path.basename(tail, path.extname(tail)))
+    } catch {
+        name = ''
+    }
+    return path.join(process.cwd(), 'deobfuscated', name || 'download')
+}
+
+// Release endpoints tend to answer 400 to a bare fetch; they only serve the
+// payload to something that looks like a real browser navigation.
+const BROWSER_HEADERS: Record<string, string> = {
+    'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'sec-ch-ua': '"Chromium";v="126", "Not:A-Brand";v="24"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Upgrade-Insecure-Requests': '1'
+}
+
+async function downloadToFile(url: string, destFile: string): Promise<void> {
+    const res = await fetch(url, { headers: BROWSER_HEADERS, redirect: 'follow' })
+    if (!res.ok) {
+        throw new Error(`Failed to fetch ${url}: HTTP ${res.status}`)
+    }
+    if (!res.body) {
+        throw new Error(`Empty response body for ${url}`)
+    }
+    await pipeline(Readable.fromWeb(res.body as any), createWriteStream(destFile))
+}
+
+async function isZipFile(filePath: string): Promise<boolean> {
+    const handle = await fs.open(filePath, 'r')
+    try {
+        const buf = Buffer.alloc(4)
+        const { bytesRead } = await handle.read(buf, 0, 4, 0)
+        return bytesRead === 4 && buf.readUInt32LE(0) === 0x04034b50
+    } finally {
+        await handle.close()
+    }
+}
+
+function isJsEntry(entry: ZipEntry): boolean {
+    return !entry.fileName.endsWith('/') && path.extname(entry.fileName).toLowerCase() === '.js'
+}
+
+/**
+ * Buffers smaller than the Buffer pool size share a single backing ArrayBuffer,
+ * so they must be copied before being transferred to a worker.
+ */
+function toTransferable(buf: Buffer): {
+    buffer: ArrayBuffer
+    byteOffset: number
+    byteLength: number
+} {
+    const canTransferZeroCopy =
+        buf.byteOffset === 0 && buf.byteLength === (buf.buffer as ArrayBuffer).byteLength
+    const ab = canTransferZeroCopy
+        ? (buf.buffer as ArrayBuffer)
+        : new Uint8Array(buf).slice().buffer
+    return { buffer: ab, byteOffset: 0, byteLength: buf.byteLength }
+}
+
+async function exportFromDirectUrl(
+    url: string,
+    options: ExportModulesOptions
+): Promise<ExportModulesResult> {
+    try {
+        new URL(url)
+    } catch {
+        throw new Error(`Invalid --direct-url value: ${url}`)
+    }
+
+    const outputDir = options.outputDir
+        ? path.resolve(process.cwd(), options.outputDir)
+        : defaultOutputDirForUrl(url)
+
+    const workersRaw = options.workers ?? 0
+    if (!Number.isFinite(workersRaw) || workersRaw < 0) {
+        throw new Error(`Invalid workers value: ${String(workersRaw)}`)
+    }
+    const poolSize = Math.floor(workersRaw)
+
+    const moduleNameFilterPatterns = normalizeModuleNameFilterPatterns(options.moduleNameFilters)
+    const moduleNameFilters = compileModuleNameFilters(moduleNameFilterPatterns)
+    const toIa = options.toIa === true
+    const mergeCommonNames = options.mergeCommonNames === true
+
+    const defaultConcurrency = Math.max(4, poolSize)
+    const concurrencyRaw = options.concurrency
+    const concurrency = concurrencyRaw === undefined ? defaultConcurrency : Number(concurrencyRaw)
+    if (!Number.isFinite(concurrency) || concurrency <= 0) {
+        throw new Error(`Invalid concurrency value: ${String(concurrencyRaw)}`)
+    }
+
+    const tmpFile = path.join(
+        os.tmpdir(),
+        `wa-export-${process.pid}-${randomBytes(6).toString('hex')}.bin`
+    )
+
+    let filesWritten = 0
+    let skippedBundles = 0
+    let bundlesProcessed = 0
+
+    await fs.mkdir(outputDir, { recursive: true })
+    await downloadToFile(url, tmpFile)
+
+    const pool = poolSize > 0 ? new WorkerPool(poolSize) : null
+
+    try {
+        if (!(await isZipFile(tmpFile))) {
+            bundlesProcessed = 1
+            const buf = await fs.readFile(tmpFile)
+
+            if (pool) {
+                const written = await pool.process(toTransferable(buf), outputDir, {
+                    disambiguate: true,
+                    toIa,
+                    mergeCommonNames,
+                    mergeCommonPrefixes: null,
+                    moduleNameFilters: moduleNameFilterPatterns
+                })
+                if (written === 0) skippedBundles = 1
+                else filesWritten = written
+            } else {
+                const files = await buildExportFiles(buf.toString('utf-8'), {
+                    toIa,
+                    mergeCommonNames,
+                    mergeCommonPrefixes: null,
+                    moduleNameFilters: moduleNameFilterPatterns
+                })
+                if (files.length === 0) {
+                    skippedBundles = 1
+                } else {
+                    await writeExportFiles(outputDir, files)
+                    filesWritten = files.length
+                }
+            }
+
+            return {
+                inputFile: url,
+                outputDir,
+                mode: 'url',
+                bundlesProcessed,
+                filesWritten,
+                skippedBundles
+            }
+        }
+
+        const reader = await ZipReader.open(tmpFile)
+
+        try {
+            // The release archive also ships .css (and whatever else); only .js
+            // can hold Metro modules, so everything else is dropped up front.
+            const jsEntries = reader.entries.filter(isJsEntry)
+            bundlesProcessed = jsEntries.length
+
+            let globalPrefixes: Array<{ raw: string; isSuffix?: boolean }> | null = null
+
+            if (mergeCommonNames) {
+                // Grouping needs the module names of the whole archive up front,
+                // but the archive does not fit in memory, so names are collected
+                // in a first pass and the payloads are re-read afterwards.
+                const allRawNames: string[] = []
+                let scanned = 0
+                await runWithConcurrency(jsEntries, concurrency, async (entry) => {
+                    const buf = await reader.read(entry)
+                    for (const dCall of extractDCalls(buf.toString('utf-8'))) {
+                        const rawName = (extractFirstStringArg(dCall) || '').trim()
+                        if (
+                            rawName &&
+                            /^[\w\[\]-]+/.test(rawName) &&
+                            moduleNameMatchesFilters(rawName, moduleNameFilters)
+                        ) {
+                            allRawNames.push(rawName)
+                        }
+                    }
+                    options.onProgress?.(++scanned, jsEntries.length)
+                })
+
+                globalPrefixes = computeMergePrefixes(allRawNames).map((p) => ({
+                    raw: p.raw,
+                    isSuffix: p.isSuffix
+                }))
+            }
+
+            let processed = 0
+            await runWithConcurrency(jsEntries, concurrency, async (entry) => {
+                const buf = await reader.read(entry)
+
+                if (pool) {
+                    const written = await pool.process(toTransferable(buf), outputDir, {
+                        disambiguate: true,
+                        toIa,
+                        mergeCommonNames,
+                        mergeCommonPrefixes: globalPrefixes,
+                        moduleNameFilters: moduleNameFilterPatterns
+                    })
+                    if (written === 0) skippedBundles++
+                    else filesWritten += written
+                } else {
+                    const files = await buildExportFiles(buf.toString('utf-8'), {
+                        disambiguate: true,
+                        toIa,
+                        mergeCommonNames,
+                        mergeCommonPrefixes: globalPrefixes,
+                        moduleNameFilters: moduleNameFilterPatterns
+                    })
+                    if (files.length === 0) {
+                        skippedBundles++
+                    } else {
+                        await writeExportFiles(outputDir, files)
+                        filesWritten += files.length
+                    }
+                }
+
+                options.onProgress?.(++processed, jsEntries.length)
+            })
+        } finally {
+            await reader.close()
+        }
+
+        return {
+            inputFile: url,
+            outputDir,
+            mode: 'archive',
+            bundlesProcessed,
+            filesWritten,
+            skippedBundles
+        }
+    } finally {
+        if (pool) await pool.destroy()
+        await fs.rm(tmpFile, { force: true })
+    }
+}
+
 export async function exportModules(options: ExportModulesOptions): Promise<ExportModulesResult> {
+    if (options.directUrl) {
+        if (options.inputFile) {
+            throw new Error('Use either inputFile or directUrl, not both')
+        }
+        return await exportFromDirectUrl(options.directUrl, options)
+    }
+
+    if (!options.inputFile) {
+        throw new Error('Missing inputFile (or directUrl)')
+    }
+
     const inputFile = path.resolve(process.cwd(), options.inputFile)
     const outputDir = options.outputDir
         ? path.resolve(process.cwd(), options.outputDir)
@@ -1224,26 +1500,13 @@ export async function exportModules(options: ExportModulesOptions): Promise<Expo
 
         if (pool) {
             const buf = await fs.readFile(inputFile)
-            const canTransferZeroCopy =
-                buf.byteOffset === 0 && buf.byteLength === (buf.buffer as ArrayBuffer).byteLength
-            const ab = canTransferZeroCopy
-                ? (buf.buffer as ArrayBuffer)
-                : new Uint8Array(buf).slice().buffer
-            const written = await pool.process(
-                {
-                    buffer: ab,
-                    byteOffset: 0,
-                    byteLength: buf.byteLength
-                },
-                outputDir,
-                {
-                    disambiguate: true,
-                    toIa,
-                    mergeCommonNames,
-                    mergeCommonPrefixes: null,
-                    moduleNameFilters: moduleNameFilterPatterns
-                }
-            )
+            const written = await pool.process(toTransferable(buf), outputDir, {
+                disambiguate: true,
+                toIa,
+                mergeCommonNames,
+                mergeCommonPrefixes: null,
+                moduleNameFilters: moduleNameFilterPatterns
+            })
             if (written === 0) {
                 skippedBundles = 1
             } else {
@@ -1303,10 +1566,22 @@ if (isMainThread && require.main === module) {
         printUsageAndExit()
     }
 
-    const inputArg = positionals[0]
-    const outputArg = positionals[1]
+    const directUrl = getArgValue(args, '--direct-url')
+    if (hasFlag(args, '--direct-url') && !directUrl) {
+        throw new Error('Missing value for --direct-url')
+    }
 
-    if (!inputArg) {
+    // With --direct-url there is no input positional, so the first positional
+    // is the output dir.
+    if (directUrl && positionals.length > 1) {
+        throw new Error(
+            `--direct-url takes no input file, only an optional output dir (got: ${positionals.join(', ')})`
+        )
+    }
+    const inputArg = directUrl ? undefined : positionals[0]
+    const outputArg = directUrl ? positionals[0] : positionals[1]
+
+    if (!inputArg && !directUrl) {
         printUsageAndExit()
     }
 
@@ -1326,9 +1601,18 @@ if (isMainThread && require.main === module) {
         throw new Error(`Invalid --concurrency value: ${String(concRaw)}`)
     }
 
+    let lastProgressAt = 0
+    const onProgress = (done: number, total: number) => {
+        if (done !== total && done - lastProgressAt < 500) return
+        lastProgressAt = done
+        console.error(`Processed ${done}/${total} bundles...`)
+    }
+
     const run = async () => {
         const result = await exportModules({
             inputFile: inputArg,
+            directUrl: directUrl ?? undefined,
+            onProgress,
             outputDir: outputArg,
             toIa: hasFlag(args, '--to-ia'),
             mergeCommonNames: hasFlag(args, '--merge-common-names'),

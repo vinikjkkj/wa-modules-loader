@@ -75,6 +75,39 @@ wa-export C:\path\to\wa-bundle.js C:\path\to\out --module-filter "/WASignal/i" -
 `--module-filter` is regex-based and can be repeated.  
 Plain values are compiled as case-insensitive regex (`new RegExp(value, 'i')`), and `/pattern/flags` keeps the provided flags.
 
+### Exporting straight from a URL
+
+`--direct-url` skips the input file entirely and downloads the bundle itself. When
+`--direct-url` is used there is no input positional, so the first positional is the output dir:
+
+```bash
+wa-export --direct-url <URL> C:\path\to\out
+
+# Same flags as the file-based modes:
+wa-export --direct-url <URL> C:\path\to\out --workers 8 --module-filter "^WASignal"
+```
+
+The URL may point at either:
+
+- **a `.js` bundle** — downloaded and split like a local bundle;
+- **a `.zip` release archive** — every entry is scanned, and each one that holds
+  Metro modules is exported.
+
+Archives are detected by their magic bytes, not by the URL or `Content-Type`.
+The request is sent with browser-like headers, since these endpoints commonly
+reject a bare fetch with HTTP 400.
+
+Notes for archive input:
+
+- **Non-`.js` entries are dropped** (a release archive also ships `.css` and
+  other assets, which can never contain `__d(` modules).
+- Output is **always flat** — archive entries are content-addressed by hash, so a
+  subfolder per bundle would just be noise. Modules with the same name across
+  different chunks collapse onto the same file. Use `--merge-common-names` to
+  group by module name instead.
+- ZIP64 archives are supported (required past 65535 entries), and entries are
+  inflated one at a time, so a multi-GB archive never has to fit in memory.
+
 Each file produced still contains the original function wrapper used by Metro.
 These files are later consumed by the library loader.
 
@@ -109,6 +142,23 @@ console.log(result)
 ```
 
 `exportModules()` supports `.js` and `.json` inputs and uses the same behavior/flags as the CLI (`toIa`, `mergeCommonNames`, `workers`, `concurrency`, `flat`/`noSubdirs`, `moduleNameFilters`).
+
+Pass `directUrl` instead of `inputFile` to download the bundle or release archive
+directly (see [Exporting straight from a URL](#exporting-straight-from-a-url)).
+Passing both is an error. `onProgress` is called as bundles complete, which is
+useful for archives holding tens of thousands of them:
+
+```ts
+const result = await exportModules({
+    directUrl: 'https://example.com/release.zip',
+    outputDir: 'C:/path/to/out/deobfuscated',
+    moduleNameFilters: ['^WASignal'],
+    workers: 8,
+    onProgress: (done, total) => console.error(`${done}/${total}`)
+})
+
+console.log(result.mode) // 'archive' for a .zip, 'url' for a single .js
+```
 
 ---
 
